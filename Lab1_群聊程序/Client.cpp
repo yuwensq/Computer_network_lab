@@ -9,12 +9,9 @@
 #define BUFFER_SIZE 1024
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 2333
-#define WAIT_TIME 100
 using namespace std;
 string name;
 string prompt;
-bool name_valid = false;
-bool recv_answer = false;
 
 struct Message {
 	string type;
@@ -100,12 +97,6 @@ DWORD WINAPI recv_thread(LPVOID lpParam) {
 				cout << endl << message.name << "加入聊天室" << endl << prompt;
 			} else if (message.type == "out") {
 				cout << endl << message.name << "离开聊天室" << endl << prompt;
-			} else if (message.type.rfind("answer", 0) == 0) {
-				string status = message.type.substr(7, message.type.length() - 7);
-				if (status == "accept") {
-					name_valid = true;
-				}
-				recv_answer = true;
 			}
 		}
 		memset(recv_buff, 0, sizeof(recv_buff));
@@ -113,44 +104,48 @@ DWORD WINAPI recv_thread(LPVOID lpParam) {
 	return 0;
 }
 
-void send_msg_to_server(SOCKET* socket) {
+void try_to_enter_room(SOCKET* socket) {
 	cout << "请输入姓名: ";
 	cin >> name;
 	getchar();
 	SOCKET* client_socket = socket;
 	char send_buff[BUFFER_SIZE];
-	string msg = "";
+	char recv_buff[BUFFER_SIZE];
 	Message greet_msg;
 	greet_msg.type = "in";
 	greet_msg.name = name;
 	string send_msg = construct_message(greet_msg);
 	strcpy(send_buff, send_msg.data());
 	send(*client_socket, send_buff, sizeof(send_buff), 0);
-	while (!recv_answer) {
-		Sleep(WAIT_TIME);
-	}
-	recv_answer = false;
-	while (!name_valid) {
+	while (recv(*client_socket, recv_buff, sizeof(recv_buff), 0) != -1) {
+		Message message = parse_message(recv_buff);
+		string status = message.type.substr(7, message.type.length() - 7);
+		if (status == "accept") {
+			break;
+		}
 		cout << "名字重复了，再想一个呗: ";
 		cin >> name;
 		getchar();
-		string msg = "";
 		greet_msg.name = name;
 		greet_msg.time = get_now_time();
 		string send_msg = construct_message(greet_msg);
 		strcpy(send_buff, send_msg.data());
 		send(*client_socket, send_buff, sizeof(send_buff), 0);
-		while (!recv_answer) {
-			Sleep(WAIT_TIME);
-		}
-		recv_answer = false;
 	}
 	cout << "成功进入聊天室" << endl;
 	prompt = name + "> ";
+	return;
+}
+
+void send_msg_to_server(SOCKET* socket) {
+	SOCKET* client_socket = socket;
+	char send_buff[BUFFER_SIZE];
 	memset(send_buff, 0, sizeof(send_buff));
 	Message message;
 	message.type = "message";
 	message.name = name;
+	string msg = "";
+	string send_msg;
 	while (true) {
 		cout << prompt;
 		getline(cin, msg);
@@ -230,7 +225,9 @@ int main() {
 	} else {
 		cout << "连接服务器成功" << endl;
 	}
-	//创建信息接收线程
+	//申请进入聊天室
+	try_to_enter_room(&client_socket);
+	//创建监听线程
 	HANDLE recv_th;
 	recv_th = CreateThread(NULL, 0, recv_thread, &client_socket, 0, NULL);
 	CloseHandle(recv_th);
