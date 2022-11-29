@@ -14,7 +14,6 @@ using namespace std;
 #define LAS 0x8
 #define RST 0x10
 #define TIMEOUT (CLOCKS_PER_SEC / 2)
-#define SEQRANGE 256
 #define TCP_SYNACK_RETRIES 5
 #define WAITTIME (CLOCKS_PER_SEC * 5)
 
@@ -194,8 +193,24 @@ void recv_file(SOCKET *server, SOCKADDR_IN *server_addr, char *data_buffer, int 
 		cout << "seq: " << header.seq << " ack: " << header.ack << " flag: " << header.flag << " checksum: " << header.checksum << " length: " << header.length << endl;
 		// 先计算一下校验和
 		u_short chksum = checksum(recv_buffer, result);
-		// 正确接收到一个报文
-		if (chksum == 0 && header.seq == expectedseqnum) {
+		// 校验和不对
+		if (chksum != 0) {
+			int n = sendto(*server, send_buffer, sizeof(Header), 0, (sockaddr*)&client_addr, sizeof(SOCKADDR_IN));
+			cout << "数据报校验和出错" << endl;
+			continue;
+		}
+		if (header.flag == FIN) {
+			Header reply_header;
+			reply_header.set_args(0, (u_short)(header.seq + 1), ACK, 0, 0);
+			memcpy(send_buffer, (char*)&reply_header, sizeof(reply_header));
+			chksum = checksum(send_buffer, sizeof(reply_header));
+			((Header*)send_buffer)->checksum = chksum;
+			int n = sendto(*server, send_buffer, sizeof(reply_header), 0, (sockaddr*)&client_addr, sizeof(SOCKADDR_IN));
+			cout << "接收到FIN报文，发回ACK报文，传输结束" << endl;
+			break;
+		}
+		// 接收到一个数据报文
+		else if (header.seq == expectedseqnum) {
 			// 发回一个ack
 			Header reply_header;
 			reply_header.set_args(0, expectedseqnum, ACK, 0, 0);
@@ -204,7 +219,6 @@ void recv_file(SOCKET *server, SOCKADDR_IN *server_addr, char *data_buffer, int 
 			((Header*)send_buffer)->checksum = chksum;
 			int n = sendto(*server, send_buffer, sizeof(reply_header), 0, (sockaddr*)&client_addr, sizeof(SOCKADDR_IN));
 			cout << "发送ACK报文:" << "seq: " << reply_header.seq << " ack: " << reply_header.ack << " flag: " << reply_header.flag << " checksum: " << chksum << " length: " << reply_header.length << endl;
-			// 确实是当前期望接收的报文
 			expectedseqnum++;
 			memcpy(data_buffer + *len, recv_buffer + sizeof(header), header.length);
 			*len += header.length;
@@ -216,22 +230,9 @@ void recv_file(SOCKET *server, SOCKADDR_IN *server_addr, char *data_buffer, int 
 				cout << "文件接收完毕，等待客户端挥手" << endl;
 			}
 		}
-		else if (chksum != 0) {
+		else {
 			int n = sendto(*server, send_buffer, sizeof(Header), 0, (sockaddr*)&client_addr, sizeof(SOCKADDR_IN));
-			cout << "数据报校验和出错" << endl;
 		}
-		// 挥手报文
-		else if (header.flag == FIN) {
-			Header reply_header;
-			reply_header.set_args(0, (header.seq + 1) % SEQRANGE, ACK, 0, 0);
-			memcpy(send_buffer, (char*)&reply_header, sizeof(reply_header));
-			chksum = checksum(send_buffer, sizeof(reply_header));
-			((Header*)send_buffer)->checksum = chksum;
-			int n = sendto(*server, send_buffer, sizeof(reply_header), 0, (sockaddr*)&client_addr, sizeof(SOCKADDR_IN));
-			cout << "接收到FIN报文，发回ACK报文，传输结束" << endl;
-			break;
-		}
-
 	}
 	delete []send_buffer;
 	delete []recv_buffer;

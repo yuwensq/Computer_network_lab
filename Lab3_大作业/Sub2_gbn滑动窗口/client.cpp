@@ -19,7 +19,6 @@ using namespace std;
 #define FIN 0x4
 #define LAS 0x8
 #define RST 0x10
-#define SEQRANGE 256
 #define TCP_SYN_RETRIES 5
 #define TCP_WAV_RETRIES 5
 #define TIMEOUT (CLOCKS_PER_SEC / 2)
@@ -51,29 +50,36 @@ struct Packet { // packet结构体
 #pragma pack(pop)
 
 class timer {
-public:
+private:
 	mutex mtx;
 	bool valid;
-	u_int period;
+	u_int esti_rtt;
 	clock_t start;
 public:
-	void start_timer(u_int period) {
+	timer() : esti_rtt(TIMEOUT) {};
+	void start_timer(u_int esti_rtt) {
 		mtx.lock();
 		valid = true;
-		this->period = period;
+		this->esti_rtt = esti_rtt;
 		start = clock();
 		mtx.unlock();
 	};
+	void start_timer() {
+		mtx.lock();
+		valid = true;
+		start = clock();
+		mtx.unlock();
+	}
 	void stop_timer() {
 		mtx.lock();
 		valid = false;
 		mtx.unlock();
 	}
 	bool time_out() {
-		return valid && (clock() - start >= period);
+		return valid && (clock() - start >= esti_rtt);
 	}
 	float remain_time() {
-		return (period - (clock() - start)) / 1000.0 <= 0 ? 0 : (period - (clock() - start)) / 1000.0;
+		return (esti_rtt - (clock() - start)) / 1000.0 <= 0 ? 0 : (esti_rtt - (clock() - start)) / 1000.0;
 	}
 };
 
@@ -83,7 +89,6 @@ bool send_over;
 int success_num;
 vector<Packet*> packets;
 u_short base, nextseqnum;
-clock_t start;
 
 u_short checksum(char *msg, int length) {
 	int size = length % 2 ? length + 1 : length;
@@ -175,6 +180,7 @@ int shake_hand(SOCKET *server, SOCKADDR_IN *server_addr) {
 }
 
 void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
+	// 开启非阻塞模式
 	u_long mode = 1;
 	ioctlsocket(*server, FIONBIO, &mode);
 	char *recv_buffer = new char[sizeof(Header)];
@@ -195,11 +201,6 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 				delete []recv_buffer;
 				return;
 			}
-			//print_lock.lock();
-			//if (my_timer.remain_time() < 0.3)
-			//cout << "计时器状态:" << my_timer.valid << " " << my_timer.remain_time() << endl;
-			//print_lock.unlock();
-			// 如果超时了，就重发
 			if (my_timer.time_out()) {
 				for (int i = base; i < nextseqnum; i++) {
 					Packet *packet = packets[i];
@@ -208,7 +209,7 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 					cout << "超时重传数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << endl;
 					print_lock.unlock();
 				}
-				my_timer.start_timer(TIMEOUT);
+				my_timer.start_timer();
 			}
 		}
 		header = (Header*)recv_buffer;
@@ -228,7 +229,7 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 			success_num = base;
 		}
 		if (base != nextseqnum) {
-			my_timer.start_timer(TIMEOUT);
+			my_timer.start_timer();
 		}
 		else {
 			my_timer.stop_timer();
@@ -251,10 +252,10 @@ void rdt_send(SOCKET *server, SOCKADDR_IN *server_addr) {
 			packet->hdr.checksum = chksum;
 			sendto(*server, (char*)packet, packet->hdr.length + sizeof(Header), 0, (sockaddr*)server_addr, sizeof(SOCKADDR_IN));
 			print_lock.lock();
-			cout << "向服务器发送数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << ", 剩余窗口大小:" << WND - (nextseqnum + 1 - base) <<endl;
+			cout << "向服务器发送数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << ", 剩余窗口大小:" << WND - (nextseqnum - base) - 1 <<endl;
 			print_lock.unlock();
 			if (base == nextseqnum) {
-				my_timer.start_timer(TIMEOUT);
+				my_timer.start_timer();
 			}
 		}		
 	}
@@ -348,7 +349,7 @@ void wave_hand(SOCKET *server, SOCKADDR_IN *server_addr) {
 		}
 		memcpy(&header, recv_buffer, sizeof(header));
 		chksum = checksum(recv_buffer, sizeof(header));
-		if (chksum == 0 && header.flag == ACK && header.ack == (seq + 1) % SEQRANGE) {
+		if (chksum == 0 && header.flag == ACK && header.ack == (u_short)(seq + 1)) {
 			cout << "接收到来自服务器的ACK报文，挥手成功" << endl;
 			break;
 		} 
@@ -372,7 +373,7 @@ int main() {
 	SOCKADDR_IN server_addr;
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_addr.S_un.S_addr = inet_addr("127.0.0.1");
-	server_addr.sin_port = htons(8888);
+	server_addr.sin_port = htons(6666);
 	// 获得文件名
 	cout << "请输入文件名: ";
 	string file_path;
