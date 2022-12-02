@@ -12,7 +12,6 @@
 #include <WinSock2.h>
 #pragma comment(lib,"ws2_32.lib")
 using namespace std;
-#define INITIALSSTHRESH 8
 #define MSS 6666
 #define WND 10
 #define SYN 0x1
@@ -20,6 +19,7 @@ using namespace std;
 #define FIN 0x4
 #define LAS 0x8
 #define RST 0x10
+#define INITIALSSTHRESH 8
 #define TCP_SYN_RETRIES 5
 #define TCP_WAV_RETRIES 5
 #define TIMEOUT (CLOCKS_PER_SEC / 2)
@@ -151,14 +151,13 @@ public:
 	}
 };
 
-
+mutex buffer_lock;
 mutex print_lock;
 timer my_timer;
 congestionAvoidancer my_cong_avoider;
 bool send_over;
-int success_num;
-vector<Packet*> packets;
-u_short base, nextseqnum;
+vector<Packet*> gbn_buffer;
+u_short base = 1, nextseqnum = 1;
 
 u_short checksum(char *msg, int length) {
 	int size = length % 2 ? length + 1 : length;
@@ -273,8 +272,7 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 			}
 			if (my_timer.time_out()) {
 				my_cong_avoider.timeOut();
-				for (int i = base; i < nextseqnum; i++) {
-					Packet *packet = packets[i];
+				for (auto packet : gbn_buffer) {
 					sendto(*server, (char*)packet, sizeof(Header) + packet->hdr.length, 0, (sockaddr*)server_addr, sizeof(SOCKADDR_IN));
 					print_lock.lock();
 					cout << "超时重传数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << endl;
@@ -302,8 +300,17 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 			else {
 				my_cong_avoider.getDupACK();
 			}
+			int recv_num = header->ack + 1 - base;
+			for (int i = 0; i < recv_num; i++) {
+				buffer_lock.lock();
+				if (gbn_buffer.size() <= 0) {
+					break;
+				}
+				delete gbn_buffer[0];
+				gbn_buffer.erase(gbn_buffer.begin());
+				buffer_lock.unlock();
+			}
 			base = header->ack + 1;
-			success_num = base;
 		}
 		if (base != nextseqnum) {
 			my_timer.start_timer();
@@ -314,32 +321,28 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 	}
 }
 
-void rdt_send(SOCKET *server, SOCKADDR_IN *server_addr) {
-	char *recv_buffer = new char[sizeof(Header)];
-	send_over = false;
-	base = nextseqnum = 0;
-	success_num = 0;
-	// 开启接收线程
-	thread receive_t(receive_thread, server, server_addr);
-	while (success_num < packets.size()) {
-		for (nextseqnum; nextseqnum < packets.size() && nextseqnum < base + WND && nextseqnum < base + my_cong_avoider.getCWND(); nextseqnum++) {
-			Packet *packet = packets[nextseqnum];
-			packet->hdr.seq = nextseqnum;
-			u_short chksum = checksum((char*)packet, packet->hdr.length + sizeof(Header));
-			packet->hdr.checksum = chksum;
-			sendto(*server, (char*)packet, packet->hdr.length + sizeof(Header), 0, (sockaddr*)server_addr, sizeof(SOCKADDR_IN));
-			print_lock.lock();
-			cout << "向服务器发送数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << ", 剩余发送窗口大小:" << WND - (nextseqnum - base) - 1 << ", 剩余拥塞窗口大小:" << my_cong_avoider.getCWND() - (nextseqnum - base) - 1 <<endl;
-			print_lock.unlock();
-			if (base == nextseqnum) {
-				my_timer.start_timer();
-			}
-		}		
+void rdt_send(SOCKET *server, SOCKADDR_IN *server_addr, char *msg, int len, bool last = false) {
+	assert(len <= MSS);
+	// 窗口满了就阻塞
+	while (nextseqnum >= base + WND || nextseqnum >= base + my_cong_avoider.getCWND()) {
+		continue;
 	}
-	send_over = true;
-	delete[] recv_buffer;
-	// 接收线程结束
-	receive_t.join();
+	Packet *packet = new Packet;
+	packet->hdr.set_args(nextseqnum, 0, last ? LAS : 0, 0, len); 
+	memcpy(packet->data, msg, len);
+	u_short chksum = checksum((char*)packet, sizeof(Header) + len);
+	packet->hdr.checksum = chksum;
+	buffer_lock.lock();
+	gbn_buffer.push_back(packet);
+	buffer_lock.unlock();
+	sendto(*server, (char*)packet, len + sizeof(Header), 0, (sockaddr*)server_addr, sizeof(SOCKADDR_IN));
+	print_lock.lock();
+	cout << "向服务器发送数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << ", 剩余发送窗口大小:" << WND - (nextseqnum - base) - 1 << ", 剩余拥塞窗口大小:" << my_cong_avoider.getCWND() - (nextseqnum - base) - 1 <<endl;
+	print_lock.unlock();
+	if (base == nextseqnum) {
+		my_timer.start_timer();
+	}
+	nextseqnum += 1;
 }
 
 void send_file(string path, SOCKET *server, SOCKADDR_IN *server_addr) {
@@ -357,25 +360,19 @@ void send_file(string path, SOCKET *server, SOCKADDR_IN *server_addr) {
 	file_buffer[path.length()] = 0; // 把文件名和文件内容分隔开
 	file.read(file_buffer + path.length() + 1, file_length);
 	file.close();
-	// 把文件分成若干个包
-	for (int offset = 0; offset < buffer_length; offset += MSS) {
-		u_short flag = 0;
-		Packet *packet = new Packet;
-		if (buffer_length - offset <= MSS) { // 如果是最后一个包了
-			flag = LAS;
-		}
-		int len = buffer_length - offset >= MSS ? MSS : buffer_length - offset;
-		packet->hdr.seq = 0;
-		packet->hdr.ack = 0;
-		packet->hdr.flag = flag;
-		packet->hdr.checksum = 0;
-		packet->hdr.length = len;
-		memcpy(packet->data, file_buffer + offset, len);
-		packets.push_back(packet);
-	}
 	cout << "开始发送文件" + path << "文件大小: " << file_length << "字节" << endl;
 	clock_t start = clock();
-	rdt_send(server, server_addr);
+	// 开启接收线程
+	thread receive_t(receive_thread, server, server_addr);
+	// 把文件分成若干个包，分别发送
+	for (int offset = 0; offset < buffer_length; offset += MSS) {
+		rdt_send(server, server_addr, file_buffer + offset, buffer_length - offset >= MSS ? MSS : buffer_length - offset, buffer_length - offset <= MSS ? true : false);
+	}
+	while (gbn_buffer.size() != 0) {
+		continue;
+	}
+	send_over = true;
+	receive_t.join();
 	clock_t end = clock();
 	cout << "发送文件" + path + "成功" << endl;
 	cout << "用时: " << (end - start) / CLOCKS_PER_SEC << "s" << endl;
