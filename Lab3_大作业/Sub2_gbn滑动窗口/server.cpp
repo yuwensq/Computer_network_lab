@@ -35,7 +35,7 @@ struct Header {
 };
 #pragma pack(pop)
 
-u_short expectedseqnum = 0;
+u_short expectedseqnum = 1;
 
 u_short checksum(char *msg, int length) {
 	int size = length % 2 ? length + 1 : length;
@@ -168,7 +168,7 @@ void recv_file(SOCKET *server, SOCKADDR_IN *server_addr, char *data_buffer, int 
 	memset(recv_buffer, 0, MSS + sizeof(header));
 	memset(send_buffer, 0, sizeof(header));
 	// 先初始化一下send_buffer
-	((Header*)send_buffer)->set_args(0, -1, ACK, 0, 0);
+	((Header*)send_buffer)->set_args(0, 0, ACK, 0, 0);
 	((Header*)send_buffer)->checksum = checksum(send_buffer, sizeof(Header));
 	// 一直接收数据
 	u_long mode = 1;
