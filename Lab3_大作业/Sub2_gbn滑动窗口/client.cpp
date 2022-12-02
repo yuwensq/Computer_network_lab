@@ -88,7 +88,6 @@ mutex print_lock;
 timer my_timer;
 bool send_over;
 vector<Packet*> gbn_buffer;
-vector<Packet*> packets;
 u_short base = 1, nextseqnum = 1;
 
 u_short checksum(char *msg, int length) {
@@ -214,9 +213,6 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 		}
 		header = (Header*)recv_buffer;
 		int chksum = checksum(recv_buffer, sizeof(Header));
-		print_lock.lock();
-		cout << "接收到来自服务器的数据包，首部为: seq:" << header->seq << ", ack:" << header->ack << ", flag:" << header->flag << ", checksum:" << header->checksum << ", len:" << header->length << endl;
-		print_lock.unlock();
 		if (chksum != 0) {
 			continue;
 		}
@@ -236,6 +232,9 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 				buffer_lock.unlock();
 			}
 			base = header->ack + 1;
+			print_lock.lock();
+			cout << "接收到来自服务器的数据包，首部为: seq:" << header->seq << ", ack:" << header->ack << ", flag:" << header->flag << ", checksum:" << header->checksum << ", len:" << header->length << ", 剩余窗口大小:" << WND - (nextseqnum - base) << endl;
+			print_lock.unlock();
 		}
 		if (base != nextseqnum) {
 			my_timer.start_timer();
