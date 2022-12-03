@@ -84,7 +84,7 @@ public:
 	}
 };
 
-class congestionAvoidancer {
+class congestionController {
 private:
 	u_int cwnd;
 	u_int ssthresh;
@@ -96,7 +96,7 @@ private:
 		QUICKRECOVER
 	} state;
 public:
-	congestionAvoidancer() {
+	congestionController() {
 		cwnd = 1;
 		ssthresh = INITIALSSTHRESH;
 		dupACKcount = 0;
@@ -105,7 +105,10 @@ public:
 	u_int getCWND() {
 		return cwnd;
 	}
-	void getNewACK() {
+	u_int getDupACK() {
+		return dupACKcount;
+	}
+	void newACK() {
 		dupACKcount = 0;
 		switch(state) {
 		case SLOWSTART: {
@@ -135,7 +138,7 @@ public:
 		cwnd = 1;
 		state = SLOWSTART;
 	}
-	void getDupACK() {
+	void dupACK() {
 		dupACKcount++;
 		if (dupACKcount < 3) {
 			return;
@@ -145,16 +148,20 @@ public:
 		case CONGESTIONAVOID: {
 			ssthresh = cwnd / 2;
 			cwnd = ssthresh + 3;
+			state = QUICKRECOVER;
+		}break;
+		case QUICKRECOVER: {
+			cwnd += 1;		   
 		}break;
 		}
-		state = QUICKRECOVER;
 	}
 };
 
+mutex send_recv_lock;
 mutex buffer_lock;
 mutex print_lock;
 timer my_timer;
-congestionAvoidancer my_cong_avoider;
+congestionController my_cong_controller;
 bool send_over;
 vector<Packet*> gbn_buffer;
 u_short base = 1, nextseqnum = 1;
@@ -271,7 +278,7 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 				return;
 			}
 			if (my_timer.time_out()) {
-				my_cong_avoider.timeOut();
+				my_cong_controller.timeOut();
 				for (auto packet : gbn_buffer) {
 					sendto(*server, (char*)packet, sizeof(Header) + packet->hdr.length, 0, (sockaddr*)server_addr, sizeof(SOCKADDR_IN));
 					print_lock.lock();
@@ -283,9 +290,6 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 		}
 		header = (Header*)recv_buffer;
 		int chksum = checksum(recv_buffer, sizeof(Header));
-		print_lock.lock();
-		cout << "接收到来自服务器的数据包，首部为: seq:" << header->seq << ", ack:" << header->ack << ", flag:" << header->flag << ", checksum:" << header->checksum << ", len:" << header->length << endl;
-		print_lock.unlock();
 		if (chksum != 0) {
 			continue;
 		}
@@ -295,10 +299,17 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 		}
 		else if (header->flag == ACK) {
 			if (header->ack >= base) {
-				my_cong_avoider.getNewACK();
+				my_cong_controller.newACK();
 			}
 			else {
-				my_cong_avoider.getDupACK();
+				my_cong_controller.dupACK();
+				if (my_cong_controller.getDupACK() == 3) {
+					Packet *packet = gbn_buffer[0];
+					sendto(*server, (char*)packet, sizeof(Header) + packet->hdr.length, 0, (sockaddr*)server_addr, sizeof(SOCKADDR_IN));
+					print_lock.lock();
+					cout << "接收到三个重复ACK，快速重传数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << endl;
+					print_lock.unlock();
+				}
 			}
 			int recv_num = header->ack + 1 - base;
 			for (int i = 0; i < recv_num; i++) {
@@ -311,6 +322,9 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 				buffer_lock.unlock();
 			}
 			base = header->ack + 1;
+			print_lock.lock();
+			cout << "接收到来自服务器的数据包，首部为: seq:" << header->seq << ", ack:" << header->ack << ", flag:" << header->flag << ", checksum:" << header->checksum << ", len:" << header->length << ", 拥塞窗口大小:" << my_cong_controller.getCWND() << endl;
+			print_lock.unlock();
 		}
 		if (base != nextseqnum) {
 			my_timer.start_timer();
@@ -324,7 +338,7 @@ void receive_thread(SOCKET *server, SOCKADDR_IN *server_addr) {
 void rdt_send(SOCKET *server, SOCKADDR_IN *server_addr, char *msg, int len, bool last = false) {
 	assert(len <= MSS);
 	// 窗口满了就阻塞
-	while (nextseqnum >= base + WND || nextseqnum >= base + my_cong_avoider.getCWND()) {
+	while ((u_short)(nextseqnum - base) >= WND || (u_short)(nextseqnum - base) >= my_cong_controller.getCWND()) {
 		continue;
 	}
 	Packet *packet = new Packet;
@@ -337,7 +351,7 @@ void rdt_send(SOCKET *server, SOCKADDR_IN *server_addr, char *msg, int len, bool
 	buffer_lock.unlock();
 	sendto(*server, (char*)packet, len + sizeof(Header), 0, (sockaddr*)server_addr, sizeof(SOCKADDR_IN));
 	print_lock.lock();
-	cout << "向服务器发送数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << ", 剩余发送窗口大小:" << WND - (nextseqnum - base) - 1 << ", 剩余拥塞窗口大小:" << my_cong_avoider.getCWND() - (nextseqnum - base) - 1 <<endl;
+	cout << "向服务器发送数据包，首部为: seq:" << packet->hdr.seq << ", ack:" << packet->hdr.ack << ", flag:" << packet->hdr.flag << ", checksum:" << packet->hdr.checksum << ", len:" << packet->hdr.length << ", 剩余发送窗口大小:" << WND - (nextseqnum - base) - 1 <<endl;
 	print_lock.unlock();
 	if (base == nextseqnum) {
 		my_timer.start_timer();
